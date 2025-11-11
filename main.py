@@ -1,9 +1,10 @@
 import os
-from fastapi import FastAPI, HTTPException
+import secrets
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional
-from database import db
+from database import db, create_document, get_documents
 from schemas import Admin
 from passlib.hash import bcrypt
 
@@ -115,7 +116,11 @@ def admin_register(payload: AdminRegisterIn):
     # Optional: set an env flag for current process lifetime
     os.environ["ADMIN_CREATED"] = "true"
 
-    return AuthResponse(success=True, message="Admin created", token="dummy-token")
+    # Create a session token and store it
+    token = secrets.token_urlsafe(32)
+    db["admin"].update_one({"username": payload.username}, {"$set": {"current_token": token}})
+
+    return AuthResponse(success=True, message="Admin created", token=token)
 
 
 @app.post("/auth/login", response_model=AuthResponse)
@@ -130,7 +135,61 @@ def admin_login(payload: AdminLoginIn):
     if not bcrypt.verify(payload.password, admin.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    return AuthResponse(success=True, token="dummy-token")
+    token = secrets.token_urlsafe(32)
+    db["admin"].update_one({"_id": admin["_id"]}, {"$set": {"current_token": token}})
+
+    return AuthResponse(success=True, token=token)
+
+
+# --------------- Simple token protection for admin-only routes ----------
+class SubscriberIn(BaseModel):
+    name: Optional[str] = None
+    email: EmailStr
+
+class SubscriberOut(BaseModel):
+    id: str
+    name: Optional[str] = None
+    email: EmailStr
+
+
+def get_current_admin(authorization: Optional[str] = Header(default=None)):
+    """Validate Bearer token stored against the admin document."""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization.split(" ", 1)[1]
+    admin = db["admin"].find_one({"current_token": token})
+    if not admin:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return admin
+
+
+@app.post("/subscribers")
+def add_subscriber(payload: SubscriberIn):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    # Basic uniqueness by email
+    existing = db["subscribers"].find_one({"email": payload.email})
+    if existing:
+        # idempotent behavior
+        return {"success": True}
+    create_document("subscribers", {"name": payload.name, "email": payload.email})
+    return {"success": True}
+
+
+@app.get("/subscribers")
+def list_subscribers(admin = Depends(get_current_admin)):
+    docs = get_documents("subscribers")
+    # Normalize ObjectId to str
+    out = []
+    for d in docs:
+        out.append({
+            "id": str(d.get("_id")),
+            "name": d.get("name"),
+            "email": d.get("email")
+        })
+    return {"items": out}
 
 
 if __name__ == "__main__":
