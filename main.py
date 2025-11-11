@@ -85,7 +85,12 @@ class AuthResponse(BaseModel):
 def _admin_exists() -> bool:
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
-    return db["admin"].count_documents({}) > 0 or os.getenv("ADMIN_CREATED", "false").lower() == "true"
+    # RESET_ADMIN=true temporarily disables the created state to allow recovery
+    reset_override = os.getenv("RESET_ADMIN", "false").lower() == "true"
+    if reset_override:
+        return False
+    exists = db["admin"].count_documents({}) > 0 or os.getenv("ADMIN_CREATED", "false").lower() == "true"
+    return exists
 
 
 @app.get("/admin/status")
@@ -95,6 +100,7 @@ def admin_status():
 
 @app.post("/admin/register", response_model=AuthResponse)
 def admin_register(payload: AdminRegisterIn):
+    # If admin already exists and no reset override, block further registrations
     if _admin_exists():
         raise HTTPException(status_code=403, detail="Admin already created")
 
@@ -113,14 +119,11 @@ def admin_register(payload: AdminRegisterIn):
 
     db["admin"].insert_one(admin_doc)
 
-    # Optional: set an env flag for current process lifetime
+    # Mark created for current process lifetime
     os.environ["ADMIN_CREATED"] = "true"
 
-    # Create a session token and store it
-    token = secrets.token_urlsafe(32)
-    db["admin"].update_one({"username": payload.username}, {"$set": {"current_token": token}})
-
-    return AuthResponse(success=True, message="Admin created", token=token)
+    # Do NOT auto-login; guide user to login page
+    return AuthResponse(success=True, message="Admin created. Please log in.")
 
 
 @app.post("/auth/login", response_model=AuthResponse)
