@@ -1,6 +1,11 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional
+from database import db
+from schemas import Admin
+from passlib.hash import bcrypt
 
 app = FastAPI()
 
@@ -12,13 +17,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 def read_root():
     return {"message": "Hello from FastAPI Backend!"}
 
+
 @app.get("/api/hello")
 def hello():
     return {"message": "Hello from the backend API!"}
+
 
 @app.get("/test")
 def test_database():
@@ -31,38 +39,98 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
-    
+
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
             response["database"] = "✅ Available"
             response["database_url"] = "✅ Configured"
             response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
             response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
+
             try:
                 collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
+                response["collections"] = collections[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
                 response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
         else:
             response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
+
     response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+
     return response
+
+
+# ----------------- Admin one-time registration & login -----------------
+class AdminRegisterIn(BaseModel):
+    full_name: str = Field(...)
+    username: str = Field(..., min_length=3)
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+
+class AdminLoginIn(BaseModel):
+    username: str
+    password: str
+
+class AuthResponse(BaseModel):
+    success: bool
+    message: Optional[str] = None
+    token: Optional[str] = None
+
+
+def _admin_exists() -> bool:
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    return db["admin"].count_documents({}) > 0 or os.getenv("ADMIN_CREATED", "false").lower() == "true"
+
+
+@app.get("/admin/status")
+def admin_status():
+    return {"admin_created": _admin_exists()}
+
+
+@app.post("/admin/register", response_model=AuthResponse)
+def admin_register(payload: AdminRegisterIn):
+    if _admin_exists():
+        raise HTTPException(status_code=403, detail="Admin already created")
+
+    # Enforce unique username/email
+    if db["admin"].find_one({"$or": [{"username": payload.username}, {"email": payload.email}] }):
+        raise HTTPException(status_code=400, detail="Username or email already in use")
+
+    password_hash = bcrypt.hash(payload.password)
+    admin_doc = Admin(
+        full_name=payload.full_name,
+        username=payload.username,
+        email=payload.email,
+        password_hash=password_hash,
+        is_active=True,
+    ).model_dump()
+
+    db["admin"].insert_one(admin_doc)
+
+    # Optional: set an env flag for current process lifetime
+    os.environ["ADMIN_CREATED"] = "true"
+
+    return AuthResponse(success=True, message="Admin created", token="dummy-token")
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+def admin_login(payload: AdminLoginIn):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    admin = db["admin"].find_one({"username": payload.username})
+    if not admin:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not bcrypt.verify(payload.password, admin.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    return AuthResponse(success=True, token="dummy-token")
 
 
 if __name__ == "__main__":
